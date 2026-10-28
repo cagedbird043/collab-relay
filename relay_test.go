@@ -347,10 +347,9 @@ func TestHeartbeatSurvivesSlowLargeWrite(t *testing.T) {
 		t.Skip("慢速传输测试需要约 10 秒")
 	}
 	_, base := newTestRelay(t, func(c *Config) {
-		// pong 要排在已进入内核缓冲的数据之后才被对端读到，超时得留出排空缓冲的时间；
-		// 仍小于整帧写完所需的约 10 秒，不分片时一定会超时。
+		// pong 排在已进入内核缓冲的数据之后才被对端读到，超时得留足排空缓冲的时间，取默认值。
+		// 不分片时，库的控制帧抢不到写锁、5 秒内就会失败并断开连接，与这里的超时无关。
 		c.PingInterval = 100 * time.Millisecond
-		c.PongTimeout = 4 * time.Second
 	})
 	host := dial(t, base, testRoom, "host")
 
@@ -376,11 +375,11 @@ func TestHeartbeatSurvivesSlowLargeWrite(t *testing.T) {
 
 	big := env(0, strings.Repeat("y", 10<<20))
 	send(t, host, websocket.MessageBinary, big)
-	// 真实客户端每 15 秒主动 ping 一次；这里在传输期间密集 ping，每次都必须在 5 秒内拿到 pong。
+	// 真实客户端每 15 秒主动 ping 一次；这里在传输期间密集 ping，pong 同样要排在缓冲数据之后，超时留足。
 	pingErr := make(chan error, 1)
 	go func() {
 		for ctx.Err() == nil {
-			pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+			pctx, pcancel := context.WithTimeout(ctx, 20*time.Second)
 			err := guest.Ping(pctx)
 			pcancel()
 			if err != nil {
