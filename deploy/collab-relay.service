@@ -1,0 +1,50 @@
+# omp collab relay（github.com/cagedbird043/collab-relay）
+# 由 deploy/deploy.sh 安装到 /etc/systemd/system/。只监听回环地址，公网由 Caddy 反代 WSS。
+[Unit]
+Description=omp collab relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 默认只允许 tailnet 来源开房（role=host），访客不限；改网段用 -host-cidrs。
+ExecStart=/usr/local/bin/collab-relay -listen 127.0.0.1:7466
+Restart=on-failure
+RestartSec=2
+# 收到 SIGTERM 后先通知所有房间关闭（guest 收 room-closed/4001，host 收 1001），客户端会自动重连。
+TimeoutStopSec=15
+
+# 沙箱：临时用户、只读文件系统、无任何特权，只能用 IPv4/IPv6 网络。
+DynamicUser=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+UMask=0077
+
+# 资源上限：防止异常情况下拖垮整机（北京只有 2G 内存）。
+MemoryMax=384M
+LimitNOFILE=8192
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target
