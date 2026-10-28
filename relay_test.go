@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -323,6 +324,111 @@ func TestHeartbeatDropsSilentPeer(t *testing.T) {
 	dial(t, base, testRoom, "guest")
 	expectText(t, host, `{"t":"peer-joined","peer":1}`)
 	expectText(t, host, `{"t":"peer-left","peer":1}`)
+}
+
+// writeThrottledConn 限制写出速度，模拟上行很慢的对端：一个大帧要很久才能完整送到 relay。
+type writeThrottledConn struct {
+	net.Conn
+	chunk int
+	pause time.Duration
+}
+
+func (c writeThrottledConn) Write(p []byte) (int, error) {
+	written := 0
+	for len(p) > 0 {
+		n := min(len(p), c.chunk)
+		m, err := c.Conn.Write(p[:n])
+		written += m
+		if err != nil {
+			return written, err
+		}
+		p = p[n:]
+		time.Sleep(c.pause)
+	}
+	return written, nil
+}
+
+// 上行慢的 host 发大快照时，回给 relay 的 pong 排在已写进内核缓冲的几 MB 数据后面，可能几十秒才到。
+// 这里的 host 从不读，所以根本不回 pong，只靠持续上传数据：只要还在收到它的数据，relay 就不能把它当死连接断开。
+func TestHeartbeatKeepsPeerThatIsStillSending(t *testing.T) {
+	_, base := newTestRelay(t, func(c *Config) {
+		c.PingInterval = 100 * time.Millisecond
+		c.PongTimeout = 300 * time.Millisecond
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		// 约 200 KiB/s。
+		return writeThrottledConn{Conn: conn, chunk: 4 << 10, pause: 20 * time.Millisecond}, nil
+	}}
+	host, _, err := websocket.Dial(ctx, base+"/r/"+testRoom+"?role=host", &websocket.DialOptions{
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer host.CloseNow()
+	guest := dial(t, base, testRoom, "guest")
+
+	// guest 一直在读，会自动回 pong；host 不读，peer-joined 留在它的接收缓冲里。
+	// 消息和最终错误走同一个通道，保证 room-closed 不会被随后的关闭错误抢先。
+	type result struct {
+		data []byte
+		err  error
+	}
+	results := make(chan result, 16)
+	go func() {
+		for {
+			_, data, err := guest.Read(context.Background())
+			results <- result{data, err}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	next := func(what string) []byte {
+		t.Helper()
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Fatalf("%s: guest lost the room: %v", what, r.err)
+			}
+			return r.data
+		case <-ctx.Done():
+			t.Fatalf("%s: timed out", what)
+			return nil
+		}
+	}
+
+	// 单个 400 KiB 的帧要约 2 秒才能送完，远超 PingInterval+PongTimeout：中途没有完整消息，只有字节在流动。
+	// relay 每读 32 KiB（约 160 ms）刷新一次活动时间，低于 PongTimeout。
+	big := env(0, strings.Repeat("z", 400<<10))
+	if err := host.Write(ctx, websocket.MessageBinary, big); err != nil {
+		t.Fatalf("host dropped mid-frame: %v", err)
+	}
+	if got := next("big frame"); !bytes.Equal(got, big) {
+		t.Fatalf("big frame: got len=%d, want len=%d", len(got), len(big))
+	}
+	// 再隔一段发几条小消息，同样跨过多个心跳周期。
+	for i := range 10 {
+		want := env(0, strconv.Itoa(i))
+		if err := host.Write(ctx, websocket.MessageBinary, want); err != nil {
+			t.Fatalf("small frame %d: %v", i, err)
+		}
+		if got := next("small frame"); !bytes.Equal(got, want) {
+			t.Fatalf("small frame %d: got %x, want %x", i, got, want)
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+
+	// host 停止发送后，既无 pong 也无数据，应被断开，guest 先收到 room-closed。
+	if got := next("after host went silent"); string(got) != `{"t":"room-closed"}` {
+		t.Fatalf("got %q, want room-closed", got)
+	}
 }
 
 // throttledConn 限制读取速度，模拟下行很慢但仍在收数据的对端。

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -10,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -90,6 +92,29 @@ type peer struct {
 	ip   netip.Addr
 	room *room
 	out  *sendQueue
+	// lastRead 是最近一次从对端读到数据的时间（UnixNano），心跳据此判断对端是否还活着。
+	lastRead atomic.Int64
+}
+
+// activityReadChunk 限制每次向库请求的字节数。库对单个帧的载荷用 io.ReadFull 读满所给切片，
+// 不限制的话 io.ReadAll 越读切片越大，一次调用可能要等很久才返回，期间 lastRead 不会刷新。
+const activityReadChunk = 32 << 10
+
+// activityReader 每读到一段数据就刷新对端的 lastRead，让正在慢慢上传一条大消息的连接也算活着。
+type activityReader struct {
+	r io.Reader
+	p *peer
+}
+
+func (a activityReader) Read(b []byte) (int, error) {
+	if len(b) > activityReadChunk {
+		b = b[:activityReadChunk]
+	}
+	n, err := a.r.Read(b)
+	if n > 0 {
+		a.p.lastRead.Store(time.Now().UnixNano())
+	}
+	return n, err
 }
 
 // Relay 实现 omp collab 的转发协议，是一个 http.Handler。
@@ -257,7 +282,12 @@ func (r *Relay) serve(ctx context.Context, p *peer) {
 
 func (r *Relay) readLoop(ctx context.Context, p *peer) {
 	for {
-		typ, data, err := p.conn.Read(ctx)
+		typ, rd, err := p.conn.Reader(ctx)
+		if err != nil {
+			return
+		}
+		p.lastRead.Store(time.Now().UnixNano())
+		data, err := io.ReadAll(activityReader{r: rd, p: p})
 		if err != nil {
 			return
 		}
@@ -364,6 +394,9 @@ func (r *Relay) writeLoop(ctx context.Context, p *peer) {
 	}
 }
 
+// heartbeat 定期 ping 对端。pong 只能排在对端已经写进内核缓冲的数据后面，对端上行慢、正在发大快照时，
+// pong 可能几十秒才到；所以 pong 超时后再看最近 PongTimeout 内有没有读到过数据，读到过就说明对端还活着，
+// 只有既没回 pong、也没发来任何数据的连接才断开。
 func (r *Relay) heartbeat(ctx context.Context, p *peer) {
 	t := time.NewTicker(r.cfg.PingInterval)
 	defer t.Stop()
@@ -376,13 +409,18 @@ func (r *Relay) heartbeat(ctx context.Context, p *peer) {
 		pctx, cancel := context.WithTimeout(ctx, r.cfg.PongTimeout)
 		err := p.conn.Ping(pctx)
 		cancel()
-		if err != nil {
-			if ctx.Err() == nil {
-				r.log.Info("心跳超时，断开", "role", p.role, "peer", p.id, "ip", p.ip)
-			}
-			p.conn.CloseNow()
+		if err == nil {
+			continue
+		}
+		if ctx.Err() != nil {
 			return
 		}
+		if time.Since(time.Unix(0, p.lastRead.Load())) < r.cfg.PongTimeout {
+			continue
+		}
+		r.log.Info("心跳超时，断开", "role", p.role, "peer", p.id, "ip", p.ip)
+		p.conn.CloseNow()
+		return
 	}
 }
 
