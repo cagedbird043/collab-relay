@@ -340,14 +340,17 @@ func (c throttledConn) Read(p []byte) (int, error) {
 	return c.Conn.Read(p)
 }
 
-// 发一个大帧要好几秒时，库的 ping 抢不到写锁会失败；这种连接仍在正常收数据，不能被当成死连接断开。
-func TestHeartbeatToleratesSlowLargeWrite(t *testing.T) {
+// 慢速下行上发一个大帧要好几秒。relay 的 ping 和对 guest 主动 ping 的自动 pong 都要在帧之间插队，
+// 这种仍在正常收数据的连接不能被任何一方当成死连接断开。
+func TestHeartbeatSurvivesSlowLargeWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("慢速传输测试需要约 10 秒")
 	}
 	_, base := newTestRelay(t, func(c *Config) {
+		// pong 要排在已进入内核缓冲的数据之后才被对端读到，超时得留出排空缓冲的时间；
+		// 仍小于整帧写完所需的约 10 秒，不分片时一定会超时。
 		c.PingInterval = 100 * time.Millisecond
-		c.PongTimeout = 300 * time.Millisecond
+		c.PongTimeout = 4 * time.Second
 	})
 	host := dial(t, base, testRoom, "host")
 
@@ -373,12 +376,31 @@ func TestHeartbeatToleratesSlowLargeWrite(t *testing.T) {
 
 	big := env(0, strings.Repeat("y", 10<<20))
 	send(t, host, websocket.MessageBinary, big)
+	// 真实客户端每 15 秒主动 ping 一次；这里在传输期间密集 ping，每次都必须在 5 秒内拿到 pong。
+	pingErr := make(chan error, 1)
+	go func() {
+		for ctx.Err() == nil {
+			pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+			err := guest.Ping(pctx)
+			pcancel()
+			if err != nil {
+				pingErr <- err
+				return
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+	}()
 	typ, data, err := guest.Read(ctx)
 	if err != nil {
 		t.Fatalf("slow guest dropped mid-transfer: %v", err)
 	}
 	if typ != websocket.MessageBinary || !bytes.Equal(data, big) {
 		t.Fatalf("got %v len=%d, want the full frame", typ, len(data))
+	}
+	select {
+	case err := <-pingErr:
+		t.Fatalf("guest ping failed during transfer: %v", err)
+	default:
 	}
 }
 

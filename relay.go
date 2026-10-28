@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -91,9 +90,6 @@ type peer struct {
 	ip   netip.Addr
 	room *room
 	out  *sendQueue
-
-	writing atomic.Bool   // 写协程正在发送一帧
-	writes  atomic.Uint64 // 已发完的帧数，心跳用来判断对端是否还在收数据
 }
 
 // Relay 实现 omp collab 的转发协议，是一个 http.Handler。
@@ -358,12 +354,9 @@ func (r *Relay) writeLoop(ctx context.Context, p *peer) {
 			_ = p.conn.Close(msg.code, msg.reason)
 			return
 		}
-		p.writing.Store(true)
 		wctx, cancel := context.WithTimeout(ctx, r.cfg.WriteTimeout)
-		err := p.conn.Write(wctx, msg.typ, msg.data)
+		err := writeMessage(wctx, p.conn, msg.typ, msg.data)
 		cancel()
-		p.writing.Store(false)
-		p.writes.Add(1)
 		if err != nil {
 			p.conn.CloseNow()
 			return
@@ -380,22 +373,39 @@ func (r *Relay) heartbeat(ctx context.Context, p *peer) {
 			return
 		case <-t.C:
 		}
-		writesBefore := p.writes.Load()
 		pctx, cancel := context.WithTimeout(ctx, r.cfg.PongTimeout)
 		err := p.conn.Ping(pctx)
 		cancel()
-		if err == nil || ctx.Err() != nil {
-			continue
+		if err != nil {
+			if ctx.Err() == nil {
+				r.log.Info("心跳超时，断开", "role", p.role, "peer", p.id, "ip", p.ip)
+			}
+			p.conn.CloseNow()
+			return
 		}
-		// 库的控制帧要和数据帧抢同一把写锁、最多等 5 秒：大帧正在发送或期间有帧发完，
-		// 说明对端还在收数据，不算死连接；真卡住的写由 WriteTimeout 兜底断开。
-		if p.writing.Load() || p.writes.Load() != writesBefore {
-			continue
-		}
-		r.log.Info("心跳超时，断开", "role", p.role, "peer", p.id, "ip", p.ip)
-		p.conn.CloseNow()
-		return
 	}
+}
+
+// writeChunk 是大消息分片的大小。
+const writeChunk = 32 << 10
+
+// writeMessage 把大消息拆成多个分片帧发送。库的写锁按帧持有，控制帧（ping、自动回复的 pong）
+// 只能在帧之间插进来，且最多等 5 秒；整条大消息一次写完的话，慢速下行上发一个快照就可能超过 5 秒，
+// 双方的心跳都会失败，把正常的连接当成死连接断开。
+func writeMessage(ctx context.Context, conn *websocket.Conn, typ websocket.MessageType, data []byte) error {
+	if len(data) <= writeChunk {
+		return conn.Write(ctx, typ, data)
+	}
+	w, err := conn.Writer(ctx, typ)
+	if err != nil {
+		return err
+	}
+	for off := 0; off < len(data); off += writeChunk {
+		if _, err := w.Write(data[off:min(off+writeChunk, len(data))]); err != nil {
+			return err
+		}
+	}
+	return w.Close()
 }
 
 // Shutdown 通知所有房间关闭并等待连接退出：guest 收到 room-closed 与 4001 后会重连，host 收到 1001 后会重建房间。
