@@ -68,9 +68,9 @@ collab.example.com {
 		query role=host
 		not remote_ip 100.64.0.0/10 fd7a:115c:a1e0::/48
 	}
-	respond @hostOutsideTailnet 403
-
 	handle /r/* {
+		# respond 必须写在 handle 里面：Caddyfile 中 handle 先于 respond 执行，写在外层永远轮不到
+		respond @hostOutsideTailnet 403
 		reverse_proxy 127.0.0.1:7466
 	}
 	handle {
@@ -78,6 +78,8 @@ collab.example.com {
 	}
 }
 ```
+
+Caddy 的 `query` 匹配器只看参数的第一个值，`?role=guest&role=host` 会被放过去，由 relay 的“`role` 恰好出现一次”检查拦下（404）。
 
 ### DNS 分流
 
