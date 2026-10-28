@@ -6,8 +6,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# 默认只允许 tailnet 来源开房（role=host），访客不限；改网段用 -host-cidrs。
-ExecStart=/usr/local/bin/collab-relay -listen 127.0.0.1:7466
+# 参数都走环境变量（COLLAB_RELAY_ 加参数名，见 README），不依赖 systemd 特有的配置方式。
+# 本机只允许 tailnet 来源开房（role=host），访客不限。
+Environment=COLLAB_RELAY_LISTEN=127.0.0.1:7466
+Environment=COLLAB_RELAY_HOST_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48
+ExecStart=/usr/local/bin/collab-relay
 Restart=on-failure
 RestartSec=2
 # 收到 SIGTERM 后先通知所有房间关闭（guest 收 room-closed/4001，host 收 1001），客户端会自动重连。

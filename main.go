@@ -24,12 +24,16 @@ var version = "dev"
 func main() {
 	cfg := DefaultConfig()
 	listen := flag.String("listen", "127.0.0.1:7466", "监听地址")
-	hostCIDRs := flag.String("host-cidrs", "100.64.0.0/10,fd7a:115c:a1e0::/48", "允许开房（role=host）的来源网段，逗号分隔；留空表示不限制")
+	hostCIDRs := flag.String("host-cidrs", "", "允许开房（role=host）的来源网段，逗号分隔；留空表示不限制")
 	flag.BoolVar(&cfg.TrustForwardedFor, "trust-xff", cfg.TrustForwardedFor, "来自回环地址的请求按 X-Forwarded-For 最后一跳识别客户端 IP")
 	flag.IntVar(&cfg.MaxRooms, "max-rooms", cfg.MaxRooms, "同时存在的房间上限")
 	flag.IntVar(&cfg.MaxGuestsPerRoom, "max-guests", cfg.MaxGuestsPerRoom, "每个房间的访客上限")
 	flag.IntVar(&cfg.MaxConnsPerIP, "max-conns-per-ip", cfg.MaxConnsPerIP, "每个来源 IP 的并发连接上限")
 	showVersion := flag.Bool("version", false, "打印版本后退出")
+	if err := applyEnv(flag.CommandLine); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	flag.Parse()
 
 	if *showVersion {
@@ -40,7 +44,7 @@ func main() {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	prefixes, err := parsePrefixes(*hostCIDRs)
 	if err != nil {
-		log.Error("解析 -host-cidrs 失败", "err", err)
+		log.Error("解析 host-cidrs 失败", "err", err)
 		os.Exit(2)
 	}
 	cfg.HostPrefixes = prefixes
@@ -73,6 +77,32 @@ func main() {
 	defer cancel()
 	relay.Shutdown(ctx)
 	_ = srv.Shutdown(ctx)
+}
+
+// envPrefix 加上参数名（大写、- 换成 _）就是对应的环境变量，例如 -host-cidrs 对应 COLLAB_RELAY_HOST_CIDRS。
+const envPrefix = "COLLAB_RELAY_"
+
+// applyEnv 用环境变量覆盖参数默认值，必须在 Parse 之前调用，命令行参数的优先级更高。
+func applyEnv(fs *flag.FlagSet) error {
+	var err error
+	fs.VisitAll(func(f *flag.Flag) {
+		if err != nil || f.Name == "version" {
+			return
+		}
+		name := envName(f.Name)
+		v, ok := os.LookupEnv(name)
+		if !ok {
+			return
+		}
+		if e := f.Value.Set(v); e != nil {
+			err = fmt.Errorf("环境变量 %s=%q 无效: %w", name, v, e)
+		}
+	})
+	return err
+}
+
+func envName(flagName string) string {
+	return envPrefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
 }
 
 func parsePrefixes(s string) ([]netip.Prefix, error) {

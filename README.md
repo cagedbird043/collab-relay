@@ -20,7 +20,7 @@ relay 只看每一帧前 4 字节的 peerId 来路由，帧内容由客户端端
 
 ## 比参考实现多的部分
 
-- **开房来源限制**：默认只有 tailnet 地址（`100.64.0.0/10`、`fd7a:115c:a1e0::/48`）能以 host 身份开房，guest 不限。外人开不了房，也就没法把 relay 当成转发隧道。`role` 参数必须恰好出现一次。
+- **开房来源限制**：可以只允许指定网段（例如 tailnet 的 `100.64.0.0/10`、`fd7a:115c:a1e0::/48`）以 host 身份开房，guest 不限。外人开不了房，也就没法把 relay 当成转发隧道。默认不限制，与参考实现一致。`role` 参数必须恰好出现一次。
 - **容量上限**：房间总数（满了返回 503）、每房间 guest 数（4029）、每个来源 IP 的并发连接数（429）、单帧 16 MiB。
 - **背压**：每个连接排队待发的数据按实际占用内存计（缓冲区容量加每条消息的开销），超过 32 MiB 就断开该连接，不在内存里无限堆积，大量极小帧也堆不出海量条目；客户端会自动重连并重新同步。
 - **心跳**：每 15 秒 ping 一次，20 秒内没有 pong 就断开，死连接最多 35 秒被清理，host 断线后能在客户端的 150 秒重连窗口内重新拿回房间。超过 32 KiB 的消息拆成分片帧发送，ping 和 pong 能插在分片之间，慢速下行收大快照时双方的心跳都不会误判；卡住的写由 30 秒写超时兜底。
@@ -28,16 +28,22 @@ relay 只看每一帧前 4 字节的 peerId 来路由，帧内容由客户端端
 - **平滑退出**：SIGTERM 时通知所有房间关闭，客户端自动重连。
 - **日志**：开房、关房、进出、被拒、超限、心跳超时都会记录（房间 ID 只记前 6 位）。
 
-## 运行参数
+## 配置
 
-```text
--listen            监听地址（默认 127.0.0.1:7466）
--host-cidrs        允许开房的来源网段，逗号分隔；留空表示不限制
--trust-xff         来自回环地址的请求按 X-Forwarded-For 最后一跳识别客户端 IP（默认开启）
--max-rooms         房间总数上限（默认 64）
--max-guests        每个房间的 guest 上限（默认 32）
--max-conns-per-ip  每个来源 IP 的并发连接上限（默认 32）
--version           打印版本
+每个参数都可以用命令行或环境变量设置，环境变量名是 `COLLAB_RELAY_` 加大写的参数名（`-` 换成 `_`），两者都给时命令行优先。
+
+| 参数 | 环境变量 | 说明 |
+|---|---|---|
+| `-listen` | `COLLAB_RELAY_LISTEN` | 监听地址（默认 `127.0.0.1:7466`） |
+| `-host-cidrs` | `COLLAB_RELAY_HOST_CIDRS` | 允许开房的来源网段，逗号分隔；默认留空，不限制 |
+| `-trust-xff` | `COLLAB_RELAY_TRUST_XFF` | 来自回环地址的请求按 X-Forwarded-For 最后一跳识别客户端 IP（默认 `true`） |
+| `-max-rooms` | `COLLAB_RELAY_MAX_ROOMS` | 房间总数上限（默认 64） |
+| `-max-guests` | `COLLAB_RELAY_MAX_GUESTS` | 每个房间的 guest 上限（默认 32） |
+| `-max-conns-per-ip` | `COLLAB_RELAY_MAX_CONNS_PER_IP` | 每个来源 IP 的并发连接上限（默认 32） |
+| `-version` | — | 打印版本 |
+
+```sh
+COLLAB_RELAY_HOST_CIDRS=100.64.0.0/10,fd7a:115c:a1e0::/48 collab-relay
 ```
 
 `GET /healthz` 返回 `ok rooms=N`，只在本机用，不经 Caddy 暴露。
@@ -49,7 +55,7 @@ deploy/deploy.sh            # 跑测试、交叉编译 linux/amd64、安装二�
 deploy/deploy.sh other-host # 部署到其他 ssh 主机
 ```
 
-systemd 单元见 `deploy/collab-relay.service`（`DynamicUser`、只读文件系统、无特权）。
+systemd 单元见 `deploy/collab-relay.service`（`DynamicUser`、只读文件系统、无特权），参数用 `Environment=` 设置，本机配置为只允许 tailnet 开房。
 
 ### Caddy
 
