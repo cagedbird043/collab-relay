@@ -1,3 +1,6 @@
+> [!IMPORTANT]
+> 本仓库已归档。relay 改用 TypeScript 重写，现在位于 [cagedbird-org/oh-my-pi-zen](https://github.com/cagedbird-org/oh-my-pi-zen) 的 [`zen/collab-relay/`](https://github.com/cagedbird-org/oh-my-pi-zen/tree/zen/main/zen/collab-relay)，以 npm 包 `@oh-my-pi-zen/collab-relay-linux-x64` 发布。
+
 # collab-relay
 
 [oh-my-pi](https://github.com/can1357/oh-my-pi)（omp）collab 协同的转发服务器，Go 实现，协议与官方 relay 兼容，客户端无需任何改动。
